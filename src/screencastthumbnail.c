@@ -357,9 +357,14 @@ struct _ScreenCastThumbnailer
   GskRenderer *renderer;
   gboolean dmabuf_failed;
 
+  /* Windows still to record, and RecordWindow calls in flight */
+  GPtrArray *windows;
+  unsigned int n_recording;
+
   unsigned int n_pending;
   unsigned int n_active;
   unsigned int timeout_id;
+  int64_t setup_start_time;
   int64_t start_time;
   gboolean started;
   gboolean done;
@@ -1191,51 +1196,7 @@ teardown_pipewire (ScreenCastThumbnailer *self)
   g_clear_pointer (&self->pw_loop, pw_thread_loop_destroy);
 }
 
-static gboolean
-record_window (ScreenCastThumbnailer  *self,
-               GDBusConnection        *connection,
-               uint64_t                window_id,
-               GError                **error)
-{
-  GVariantBuilder properties_builder;
-  g_autofree char *stream_path = NULL;
-  ThumbnailStream *stream;
-
-  g_variant_builder_init (&properties_builder, G_VARIANT_TYPE_VARDICT);
-  g_variant_builder_add (&properties_builder, "{sv}",
-                         "window-id", g_variant_new_uint64 (window_id));
-
-  if (!org_gnome_mutter_screen_cast_session_call_record_window_sync (self->session,
-                                                                     g_variant_builder_end (&properties_builder),
-                                                                     &stream_path,
-                                                                     NULL,
-                                                                     error))
-    return FALSE;
-
-  stream = g_new0 (ThumbnailStream, 1);
-  stream->thumbnailer = self;
-  stream->window_id = window_id;
-  stream->node_id = SPA_ID_INVALID;
-  stream->proxy =
-    org_gnome_mutter_screen_cast_stream_proxy_new_sync (connection,
-                                                        G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                        "org.gnome.Mutter.ScreenCast",
-                                                        stream_path,
-                                                        NULL,
-                                                        error);
-  if (!stream->proxy)
-    {
-      thumbnail_stream_free (stream);
-      return FALSE;
-    }
-
-  g_signal_connect (stream->proxy, "pipewire-stream-added",
-                    G_CALLBACK (on_pipewire_stream_added),
-                    stream);
-
-  g_ptr_array_add (self->streams, stream);
-  return TRUE;
-}
+static void release_session (ScreenCastThumbnailer *self);
 
 static gboolean
 on_timeout_cb (gpointer user_data)
@@ -1249,82 +1210,253 @@ on_timeout_cb (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
-static gboolean
-start_session (ScreenCastThumbnailer  *self,
-               GListModel             *windows,
-               GError                **error)
+static void
+fail_session_setup (ScreenCastThumbnailer *self,
+                    GError                *error)
 {
-  g_autoptr(GDBusConnection) connection = NULL;
-  g_autoptr(OrgGnomeMutterScreenCast) screen_cast = NULL;
-  GVariantBuilder properties_builder;
-  g_autofree char *session_path = NULL;
-  int64_t setup_start_time = g_get_monotonic_time ();
-  unsigned int i;
+  if (self->done)
+    return;
 
-  if (g_list_model_get_n_items (windows) == 0)
-    return TRUE;
+  g_warning ("Failed to capture window thumbnails: %s", error->message);
+  screen_cast_thumbnailer_stop (self);
+}
 
-  connection = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, error);
-  if (!connection)
-    return FALSE;
+static void
+on_session_started (GObject      *source_object,
+                    GAsyncResult *result,
+                    gpointer      user_data)
+{
+  g_autoptr(ScreenCastThumbnailer) self = user_data;
+  g_autoptr(GError) error = NULL;
 
-  screen_cast =
-    org_gnome_mutter_screen_cast_proxy_new_sync (connection,
-                                                 G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                 "org.gnome.Mutter.ScreenCast",
-                                                 "/org/gnome/Mutter/ScreenCast",
-                                                 NULL,
-                                                 error);
-  if (!screen_cast)
-    return FALSE;
-
-  g_variant_builder_init (&properties_builder, G_VARIANT_TYPE_VARDICT);
-  if (!org_gnome_mutter_screen_cast_call_create_session_sync (screen_cast,
-                                                              g_variant_builder_end (&properties_builder),
-                                                              &session_path,
-                                                              NULL,
-                                                              error))
-    return FALSE;
-
-  self->session =
-    org_gnome_mutter_screen_cast_session_proxy_new_sync (connection,
-                                                         G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                         "org.gnome.Mutter.ScreenCast",
-                                                         session_path,
-                                                         NULL,
-                                                         error);
-  if (!self->session)
-    return FALSE;
-
-  if (!setup_pipewire (self, error))
-    return FALSE;
-
-  for (i = 0; i < g_list_model_get_n_items (windows); i++)
+  if (!org_gnome_mutter_screen_cast_session_call_start_finish (ORG_GNOME_MUTTER_SCREEN_CAST_SESSION (source_object),
+                                                               result,
+                                                               &error))
     {
-      g_autoptr(ShellWindow) window = g_list_model_get_item (windows, i);
-      g_autoptr(GError) local_error = NULL;
-
-      if (!record_window (self, connection, shell_window_get_id (window), &local_error))
-        g_debug ("Not thumbnailing window %s: %s",
-                 shell_window_get_title (window), local_error->message);
+      fail_session_setup (self, error);
+      return;
     }
 
-  self->n_pending = self->streams->len;
-  if (self->n_pending == 0)
-    return TRUE;
-
-  if (!org_gnome_mutter_screen_cast_session_call_start_sync (self->session, NULL, error))
-    return FALSE;
+  if (self->done)
+    return;
 
   self->start_time = g_get_monotonic_time ();
   g_debug ("Window thumbnail session for %u windows set up in %" G_GINT64_FORMAT " ms",
-           self->n_pending, (self->start_time - setup_start_time) / 1000);
+           self->n_pending, (self->start_time - self->setup_start_time) / 1000);
   self->timeout_id =
     g_timeout_add (SESSION_EXTRA_TIMEOUT_MS +
                    WINDOW_STREAM_TIMEOUT_MS * ((self->n_pending + MAX_ACTIVE_WINDOW_STREAMS - 1) /
                                                MAX_ACTIVE_WINDOW_STREAMS),
                    on_timeout_cb, self);
-  return TRUE;
+}
+
+typedef struct
+{
+  ScreenCastThumbnailer *thumbnailer;
+  uint64_t window_id;
+  char *title;
+} RecordWindowData;
+
+static void
+record_window_data_free (RecordWindowData *data)
+{
+  g_clear_object (&data->thumbnailer);
+  g_free (data->title);
+  g_free (data);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (RecordWindowData, record_window_data_free)
+
+static void
+add_stream (ScreenCastThumbnailer *self,
+            uint64_t               window_id,
+            const char            *stream_path)
+{
+  ThumbnailStream *stream;
+
+  stream = g_new0 (ThumbnailStream, 1);
+  stream->thumbnailer = self;
+  stream->window_id = window_id;
+  stream->node_id = SPA_ID_INVALID;
+
+  /* Mutter's unique name and no properties need no round trips; the signal
+   * subscription reaches the bus before Start does */
+  stream->proxy =
+    org_gnome_mutter_screen_cast_stream_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (self->session)),
+                                                        G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START |
+                                                        G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+                                                        g_dbus_proxy_get_name (G_DBUS_PROXY (self->session)),
+                                                        stream_path,
+                                                        NULL,
+                                                        NULL);
+  if (!stream->proxy)
+    {
+      thumbnail_stream_free (stream);
+      return;
+    }
+
+  g_signal_connect (stream->proxy, "pipewire-stream-added",
+                    G_CALLBACK (on_pipewire_stream_added),
+                    stream);
+
+  g_ptr_array_add (self->streams, stream);
+}
+
+static void
+on_window_recorded (GObject      *source_object,
+                    GAsyncResult *result,
+                    gpointer      user_data)
+{
+  g_autoptr(RecordWindowData) data = user_data;
+  ScreenCastThumbnailer *self = data->thumbnailer;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *stream_path = NULL;
+
+  if (!org_gnome_mutter_screen_cast_session_call_record_window_finish (ORG_GNOME_MUTTER_SCREEN_CAST_SESSION (source_object),
+                                                                       &stream_path,
+                                                                       result,
+                                                                       &error))
+    {
+      if (!self->done)
+        g_debug ("Not thumbnailing window %s: %s", data->title, error->message);
+    }
+  else if (!self->done)
+    {
+      add_stream (self, data->window_id, stream_path);
+    }
+
+  if (self->done || --self->n_recording > 0)
+    return;
+
+  self->n_pending = self->streams->len;
+  if (self->n_pending == 0)
+    {
+      screen_cast_thumbnailer_stop (self);
+      return;
+    }
+
+  org_gnome_mutter_screen_cast_session_call_start (self->session,
+                                                   NULL,
+                                                   on_session_started,
+                                                   g_object_ref (self));
+}
+
+static void
+record_windows (ScreenCastThumbnailer *self)
+{
+  unsigned int i;
+
+  /* All in flight at once, rather than a round trip each */
+  self->n_recording = self->windows->len;
+  for (i = 0; i < self->windows->len; i++)
+    {
+      ShellWindow *window = g_ptr_array_index (self->windows, i);
+      GVariantBuilder properties_builder;
+      RecordWindowData *data;
+
+      data = g_new0 (RecordWindowData, 1);
+      data->thumbnailer = g_object_ref (self);
+      data->window_id = shell_window_get_id (window);
+      data->title = g_strdup (shell_window_get_title (window));
+
+      g_variant_builder_init (&properties_builder, G_VARIANT_TYPE_VARDICT);
+      g_variant_builder_add (&properties_builder, "{sv}",
+                             "window-id", g_variant_new_uint64 (data->window_id));
+
+      org_gnome_mutter_screen_cast_session_call_record_window (self->session,
+                                                               g_variant_builder_end (&properties_builder),
+                                                               NULL,
+                                                               on_window_recorded,
+                                                               data);
+    }
+
+  g_clear_pointer (&self->windows, g_ptr_array_unref);
+}
+
+static void
+on_session_created (GObject      *source_object,
+                    GAsyncResult *result,
+                    gpointer      user_data)
+{
+  g_autoptr(ScreenCastThumbnailer) self = user_data;
+  GDBusProxy *screen_cast = G_DBUS_PROXY (source_object);
+  g_autoptr(GError) error = NULL;
+  g_autofree char *session_path = NULL;
+
+  if (!org_gnome_mutter_screen_cast_call_create_session_finish (ORG_GNOME_MUTTER_SCREEN_CAST (screen_cast),
+                                                                &session_path,
+                                                                result,
+                                                                &error))
+    {
+      fail_session_setup (self, error);
+      return;
+    }
+
+  self->session =
+    org_gnome_mutter_screen_cast_session_proxy_new_sync (g_dbus_proxy_get_connection (screen_cast),
+                                                         G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START |
+                                                         G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES |
+                                                         G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS,
+                                                         g_dbus_proxy_get_name_owner (screen_cast),
+                                                         session_path,
+                                                         NULL,
+                                                         &error);
+  if (!self->session)
+    {
+      fail_session_setup (self, error);
+      return;
+    }
+
+  /* Stopped while the session was being created; don't leave it behind */
+  if (self->done)
+    {
+      release_session (self);
+      return;
+    }
+
+  if (!setup_pipewire (self, &error))
+    {
+      fail_session_setup (self, error);
+      return;
+    }
+
+  record_windows (self);
+}
+
+static void
+on_screen_cast_proxy_ready (GObject      *source_object,
+                            GAsyncResult *result,
+                            gpointer      user_data)
+{
+  g_autoptr(ScreenCastThumbnailer) self = user_data;
+  g_autoptr(OrgGnomeMutterScreenCast) screen_cast = NULL;
+  g_autoptr(GError) error = NULL;
+  GVariantBuilder properties_builder;
+
+  screen_cast = org_gnome_mutter_screen_cast_proxy_new_for_bus_finish (result, &error);
+  if (!screen_cast)
+    {
+      fail_session_setup (self, error);
+      return;
+    }
+
+  if (self->done)
+    return;
+
+  if (!g_dbus_proxy_get_name_owner (G_DBUS_PROXY (screen_cast)))
+    {
+      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                   "org.gnome.Mutter.ScreenCast is not running");
+      fail_session_setup (self, error);
+      return;
+    }
+
+  g_variant_builder_init (&properties_builder, G_VARIANT_TYPE_VARDICT);
+  org_gnome_mutter_screen_cast_call_create_session (screen_cast,
+                                                    g_variant_builder_end (&properties_builder),
+                                                    NULL,
+                                                    on_session_created,
+                                                    g_steal_pointer (&self));
 }
 
 static void
@@ -1335,6 +1467,7 @@ release_session (ScreenCastThumbnailer *self)
   teardown_pipewire (self);
   g_queue_clear (&self->streams_to_connect);
   g_ptr_array_set_size (self->streams, 0);
+  g_clear_pointer (&self->windows, g_ptr_array_unref);
   g_clear_object (&self->renderer);
 
   if (self->session)
@@ -1426,7 +1559,7 @@ screen_cast_thumbnailer_start (ScreenCastThumbnailer *self,
                                GListModel            *windows,
                                GskRenderer           *renderer)
 {
-  g_autoptr(GError) error = NULL;
+  unsigned int i;
 
   g_return_if_fail (SCREEN_CAST_IS_THUMBNAILER (self));
 
@@ -1436,11 +1569,26 @@ screen_cast_thumbnailer_start (ScreenCastThumbnailer *self,
   self->started = TRUE;
   g_set_object (&self->renderer, renderer);
 
-  if (!start_session (self, windows, &error))
-    g_warning ("Failed to capture window thumbnails: %s", error->message);
+  self->windows = g_ptr_array_new_with_free_func (g_object_unref);
+  for (i = 0; i < g_list_model_get_n_items (windows); i++)
+    g_ptr_array_add (self->windows, g_list_model_get_item (windows, i));
 
-  if (self->n_pending == 0)
-    screen_cast_thumbnailer_stop (self);
+  if (self->windows->len == 0)
+    {
+      screen_cast_thumbnailer_stop (self);
+      return;
+    }
+
+  self->setup_start_time = g_get_monotonic_time ();
+  org_gnome_mutter_screen_cast_proxy_new_for_bus (G_BUS_TYPE_SESSION,
+                                                  G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START |
+                                                  G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES |
+                                                  G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS,
+                                                  "org.gnome.Mutter.ScreenCast",
+                                                  "/org/gnome/Mutter/ScreenCast",
+                                                  NULL,
+                                                  on_screen_cast_proxy_ready,
+                                                  g_object_ref (self));
 }
 
 void
