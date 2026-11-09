@@ -46,13 +46,17 @@
                 <property name="title" translatable="yes">_Window</property>
                 <property name="use-underline">True</property>
                 <property name="child">
-                  <object class="GtkListBox" id="window_list">
+                  <object class="GtkFlowBox" id="window_list">
                     <property name="hexpand">True</property>
                     <property name="vexpand">True</property>
                     <property name="valign">start</property>
-                    <style>
-                      <class name="content" />
-                    </style>
+                    <property name="homogeneous">True</property>
+                    <property name="min-children-per-line">3</property>
+                    <property name="max-children-per-line">3</property>
+                    <property name="column-spacing">6</property>
+                    <property name="row-spacing">6</property>
+                    <property name="selection-mode">none</property>
+                    <property name="activate-on-single-click">True</property>
                   </object>
                 </property>
               </object>

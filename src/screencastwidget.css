@@ -68,9 +68,22 @@ geometry-container.singular {
   background-color: alpha(black, 0.7);
 }
 
+.window-card {
+  padding: 6px;
+  border-radius: 12px;
+}
+
 .window-thumbnail {
-  border-radius: 6px;
+  border-radius: 8px;
   background-color: alpha(currentColor, 0.08);
+}
+
+.window-check {
+  margin: 6px;
+  padding: 4px;
+  border-radius: 9999px;
+  color: @accent_fg_color;
+  background-color: @accent_bg_color;
 }
 
 .window-selected {

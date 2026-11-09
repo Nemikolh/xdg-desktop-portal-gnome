@@ -89,6 +89,7 @@ update_row_thumbnail (GtkWidget        *row,
                       ScreenCastWidget *self)
 {
   GtkWidget *thumbnail = g_object_get_data (G_OBJECT (row), "thumbnail");
+  GtkWidget *fallback_icon = g_object_get_data (G_OBJECT (row), "fallback-icon");
   uint64_t *window_id = g_object_get_data (G_OBJECT (row), "window-id");
   GdkTexture *texture;
 
@@ -98,19 +99,34 @@ update_row_thumbnail (GtkWidget        *row,
   texture = screen_cast_thumbnailer_lookup (self->thumbnailer, *window_id);
   screen_cast_thumbnail_view_set_texture (SCREEN_CAST_THUMBNAIL_VIEW (thumbnail), texture);
 
-  /* Keep the placeholder while a frame may still arrive */
-  gtk_widget_set_visible (thumbnail,
-                          texture != NULL ||
-                          !screen_cast_thumbnailer_is_done (self->thumbnailer));
+  /* Keep the empty placeholder while a frame may still arrive */
+  gtk_widget_set_visible (fallback_icon,
+                          texture == NULL &&
+                          screen_cast_thumbnailer_is_done (self->thumbnailer));
+}
+
+static GtkWidget *
+new_image_from_gicon (GIcon *icon,
+                      int    pixel_size)
+{
+  GtkWidget *image;
+
+  image = gtk_image_new_from_gicon (icon);
+  gtk_image_set_pixel_size (GTK_IMAGE (image), pixel_size);
+  return image;
 }
 
 static GtkWidget *
 create_window_widget (ShellWindow      *window,
                       ScreenCastWidget *self)
 {
-  GtkWidget *window_image;
+  GtkWidget *fallback_icon;
   GtkWidget *check_image;
   GtkWidget *thumbnail;
+  GtkWidget *overlay;
+  GtkWidget *title;
+  GtkWidget *header;
+  GtkWidget *card;
   GtkWidget *row;
   uint64_t window_id;
   g_autoptr(GIcon) icon = NULL;
@@ -123,28 +139,54 @@ create_window_widget (ShellWindow      *window,
     icon = g_themed_icon_new ("application-x-executable");
   else
     icon = g_object_ref (icon);
-  window_image = gtk_image_new_from_gicon (icon);
-  gtk_image_set_pixel_size (GTK_IMAGE (window_image), 32);
 
   thumbnail = screen_cast_thumbnail_view_new (GTK_CONTENT_FIT_CONTAIN);
-  gtk_widget_set_size_request (thumbnail, 96, 54);
-  gtk_widget_set_valign (thumbnail, GTK_ALIGN_CENTER);
-  gtk_widget_add_css_class (thumbnail, "window-thumbnail");
+  gtk_widget_set_size_request (thumbnail, -1, 108);
+
+  /* Shown instead of the thumbnail if no frame arrives */
+  fallback_icon = new_image_from_gicon (icon, 64);
+  gtk_widget_set_visible (fallback_icon, FALSE);
 
   check_image = gtk_image_new_from_icon_name ("object-select-symbolic");
+  gtk_widget_set_halign (check_image, GTK_ALIGN_END);
+  gtk_widget_set_valign (check_image, GTK_ALIGN_START);
+  gtk_widget_add_css_class (check_image, "window-check");
   gtk_widget_set_visible (check_image, FALSE);
 
-  row = adw_action_row_new ();
-  adw_action_row_add_prefix (ADW_ACTION_ROW (row), thumbnail);
-  adw_action_row_add_prefix (ADW_ACTION_ROW (row), window_image);
-  adw_action_row_add_suffix (ADW_ACTION_ROW (row), check_image);
-  gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), TRUE);
-  gtk_list_box_row_set_selectable (GTK_LIST_BOX_ROW (row), FALSE);
+  overlay = gtk_overlay_new ();
+  gtk_widget_set_overflow (overlay, GTK_OVERFLOW_HIDDEN);
+  gtk_widget_add_css_class (overlay, "window-thumbnail");
+  gtk_overlay_set_child (GTK_OVERLAY (overlay), thumbnail);
+  gtk_overlay_add_overlay (GTK_OVERLAY (overlay), fallback_icon);
+  gtk_overlay_add_overlay (GTK_OVERLAY (overlay), check_image);
 
-  g_object_bind_property (window, "title", row, "title", G_BINDING_SYNC_CREATE);
+  title = gtk_label_new (NULL);
+  gtk_label_set_ellipsize (GTK_LABEL (title), PANGO_ELLIPSIZE_END);
+  gtk_label_set_single_line_mode (GTK_LABEL (title), TRUE);
+  /* Long titles must not widen the grid, so cap the natural width too */
+  gtk_label_set_width_chars (GTK_LABEL (title), 1);
+  gtk_label_set_max_width_chars (GTK_LABEL (title), 20);
+  gtk_label_set_xalign (GTK_LABEL (title), 0.0);
+  gtk_widget_set_hexpand (title, TRUE);
+
+  header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_append (GTK_BOX (header), new_image_from_gicon (icon, 16));
+  gtk_box_append (GTK_BOX (header), title);
+
+  card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  gtk_box_append (GTK_BOX (card), overlay);
+  gtk_box_append (GTK_BOX (card), header);
+
+  row = gtk_flow_box_child_new ();
+  gtk_flow_box_child_set_child (GTK_FLOW_BOX_CHILD (row), card);
+  gtk_widget_add_css_class (row, "window-card");
+
+  g_object_bind_property (window, "title", title, "label", G_BINDING_SYNC_CREATE);
+  g_object_bind_property (window, "title", row, "tooltip-text", G_BINDING_SYNC_CREATE);
 
   g_object_set_data (G_OBJECT (row), "check", check_image);
   g_object_set_data (G_OBJECT (row), "thumbnail", thumbnail);
+  g_object_set_data (G_OBJECT (row), "fallback-icon", fallback_icon);
   window_id = shell_window_get_id (window);
   g_object_set_data_full (G_OBJECT (row), "window-id",
                           g_memdup2 (&window_id, sizeof (window_id)),
@@ -415,7 +457,7 @@ update_monitor_container (ScreenCastWidget *widget)
 }
 
 static gboolean
-is_row_selected (GtkListBoxRow *row)
+is_row_selected (GtkWidget *row)
 {
   GtkWidget *check_image = g_object_get_data (G_OBJECT (row), "check");
   return gtk_widget_get_visible (check_image);
@@ -423,7 +465,7 @@ is_row_selected (GtkListBoxRow *row)
 
 static void
 set_row_is_selected (ScreenCastWidget *widget,
-                     GtkListBoxRow    *row,
+                     GtkWidget        *row,
                      gboolean          is_selected)
 {
   GtkWidget *check_image = g_object_get_data (G_OBJECT (row), "check");
@@ -447,7 +489,7 @@ set_row_is_selected (ScreenCastWidget *widget,
 }
 
 static void
-unselect_row (GtkListBoxRow    *row,
+unselect_row (GtkWidget        *row,
               ScreenCastWidget *widget)
 {
   set_row_is_selected (widget, row, FALSE);
@@ -505,10 +547,12 @@ on_stack_switch (ScreenCastWidget *self,
 }
 
 static void
-on_row_activated (ScreenCastWidget *self,
-                  GtkListBoxRow    *row,
-                  GtkListBox       *box)
+on_child_activated (ScreenCastWidget *self,
+                    GtkFlowBoxChild  *child,
+                    GtkFlowBox       *box)
 {
+  GtkWidget *row = GTK_WIDGET (child);
+
   if (!row)
     return;
 
@@ -531,8 +575,8 @@ get_selected_windows (ScreenCastWidget *widget)
 
   for (i = 0; i < g_list_model_get_n_items (widget->filter_model); i++)
     {
-      GtkListBoxRow *row =
-        gtk_list_box_get_row_at_index (GTK_LIST_BOX (widget->window_list), i);
+      GtkFlowBoxChild *row =
+        gtk_flow_box_get_child_at_index (GTK_FLOW_BOX (widget->window_list), i);
 
       if (g_object_get_data (G_OBJECT (row), "window-selected"))
         {
@@ -731,9 +775,9 @@ screen_cast_widget_init (ScreenCastWidget *widget)
                                    shell_introspect_get_windows (widget->shell_introspect));
   gtk_filter_list_model_set_filter (GTK_FILTER_LIST_MODEL (widget->filter_model), filter);
 
-  gtk_list_box_bind_model (GTK_LIST_BOX (widget->window_list),
+  gtk_flow_box_bind_model (GTK_FLOW_BOX (widget->window_list),
                            widget->filter_model,
-                           (GtkListBoxCreateWidgetFunc) create_window_widget,
+                           (GtkFlowBoxCreateWidgetFunc) create_window_widget,
                            widget, NULL);
 
   g_object_connect (widget->thumbnailer,
@@ -746,7 +790,7 @@ screen_cast_widget_init (ScreenCastWidget *widget)
                             G_CALLBACK (schedule_selection_change),
                             widget);
   g_object_connect (widget->window_list,
-                    "swapped-signal::row-activated", G_CALLBACK (on_row_activated), widget,
+                    "swapped-signal::child-activated", G_CALLBACK (on_child_activated), widget,
                     NULL);
 
   g_signal_connect_swapped (widget->source_type,
@@ -795,9 +839,6 @@ screen_cast_widget_set_allow_multiple (ScreenCastWidget *widget,
                                        gboolean          multiple)
 {
   widget->allow_multiple = multiple;
-
-  gtk_list_box_set_selection_mode (GTK_LIST_BOX (widget->window_list),
-                                   multiple ? GTK_SELECTION_MULTIPLE : GTK_SELECTION_SINGLE);
 
   if (!multiple)
     reset_selection (widget);

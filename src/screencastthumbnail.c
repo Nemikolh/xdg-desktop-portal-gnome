@@ -30,8 +30,18 @@
 #include "shell-dbus.h"
 #include "shellintrospect.h"
 
-/* How long window streams get to deliver their first frame */
-#define WINDOW_THUMBNAIL_TIMEOUT_MS 3000
+/* With shared memory buffers Mutter reads each window frame back from the GPU
+ * synchronously on its main thread, stalling the whole compositor; recording
+ * every window at once froze the desktop for seconds. Mutter only renders a
+ * stream while a consumer streams from it, so we bound that by connecting to
+ * a few windows at a time. */
+#define MAX_ACTIVE_WINDOW_STREAMS 2
+
+/* How long one window stream gets to deliver its first frame */
+#define WINDOW_STREAM_TIMEOUT_MS 1000
+
+/* Covers streams Mutter never announces a PipeWire node for */
+#define SESSION_EXTRA_TIMEOUT_MS 1500
 
 /*
  * Monitor thumbnails
@@ -256,6 +266,9 @@ typedef struct
   uint64_t window_id;
 
   OrgGnomeMutterScreenCastStream *proxy;
+  uint32_t node_id;
+  unsigned int timeout_id;
+  gboolean finished;
 
   /* Owned by the PipeWire thread while the thread loop runs */
   struct pw_stream *pw_stream;
@@ -281,6 +294,7 @@ struct _ScreenCastThumbnailer
 
   OrgGnomeMutterScreenCastSession *session;
   GPtrArray *streams;
+  GQueue streams_to_connect;
   GHashTable *textures;
 
   struct pw_thread_loop *pw_loop;
@@ -288,7 +302,9 @@ struct _ScreenCastThumbnailer
   struct pw_core *pw_core;
 
   unsigned int n_pending;
+  unsigned int n_active;
   unsigned int timeout_id;
+  int64_t start_time;
   gboolean started;
   gboolean done;
 };
@@ -332,12 +348,15 @@ thumbnail_frame_free (ThumbnailFrame *frame)
   g_free (frame);
 }
 
+static void finish_stream (ThumbnailStream *stream);
+
 static gboolean
 deliver_frame_cb (gpointer user_data)
 {
   ThumbnailFrame *frame = user_data;
   ScreenCastThumbnailer *self = frame->thumbnailer;
   g_autoptr(GdkTexture) texture = NULL;
+  unsigned int i;
 
   texture = gdk_memory_texture_new (frame->width,
                                     frame->height,
@@ -348,10 +367,22 @@ deliver_frame_cb (gpointer user_data)
   g_hash_table_insert (self->textures,
                        g_memdup2 (&frame->window_id, sizeof (frame->window_id)),
                        g_object_ref (texture));
+  g_debug ("Window thumbnail %" G_GUINT64_FORMAT " (%dx%d) after %" G_GINT64_FORMAT " ms",
+           frame->window_id, frame->width, frame->height,
+           (g_get_monotonic_time () - self->start_time) / 1000);
   g_signal_emit (self, signals[THUMBNAIL_READY], 0, frame->window_id, texture);
 
-  if (self->n_pending > 0 && --self->n_pending == 0)
-    screen_cast_thumbnailer_stop (self);
+  /* Streams are gone if the thumbnailer stopped meanwhile */
+  for (i = 0; i < self->streams->len; i++)
+    {
+      ThumbnailStream *stream = g_ptr_array_index (self->streams, i);
+
+      if (stream->window_id == frame->window_id)
+        {
+          finish_stream (stream);
+          break;
+        }
+    }
 
   return G_SOURCE_REMOVE;
 }
@@ -489,8 +520,10 @@ on_pw_stream_param_changed (void                 *user_data,
   stream->has_format = TRUE;
 
   /* Shared memory only: no DMA-BUF, so no GPU readback is needed */
+  /* Mutter defaults to 8 window-sized buffers; one frame needs the minimum */
   params[0] = spa_pod_builder_add_object (&builder,
     SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+    SPA_PARAM_BUFFERS_buffers, SPA_POD_Int (2),
     SPA_PARAM_BUFFERS_dataType, SPA_POD_Int ((1 << SPA_DATA_MemPtr) |
                                              (1 << SPA_DATA_MemFd)));
   params[1] = spa_pod_builder_add_object (&builder,
@@ -512,18 +545,14 @@ static const struct pw_stream_events pw_stream_events = {
 };
 
 static void
-on_pipewire_stream_added (OrgGnomeMutterScreenCastStream *proxy,
-                          unsigned int                    node_id,
-                          ThumbnailStream                *stream)
+connect_pw_stream (ThumbnailStream *stream)
 {
   ScreenCastThumbnailer *self = stream->thumbnailer;
+  uint32_t node_id = stream->node_id;
   uint8_t params_buffer[1024];
   struct spa_pod_builder builder =
     SPA_POD_BUILDER_INIT (params_buffer, sizeof (params_buffer));
   const struct spa_pod *params[1];
-
-  if (self->done || !self->pw_core || stream->pw_stream)
-    return;
 
   params[0] = spa_pod_builder_add_object (&builder,
     SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
@@ -570,10 +599,91 @@ on_pipewire_stream_added (OrgGnomeMutterScreenCastStream *proxy,
 }
 
 static void
+disconnect_pw_stream (ThumbnailStream *stream)
+{
+  ScreenCastThumbnailer *self = stream->thumbnailer;
+
+  if (!stream->pw_stream)
+    return;
+
+  pw_thread_loop_lock (self->pw_loop);
+  spa_hook_remove (&stream->pw_stream_listener);
+  g_clear_pointer (&stream->pw_stream, pw_stream_destroy);
+  pw_thread_loop_unlock (self->pw_loop);
+}
+
+static gboolean
+on_stream_timeout_cb (gpointer user_data)
+{
+  ThumbnailStream *stream = user_data;
+
+  stream->timeout_id = 0;
+  g_debug ("Window thumbnail %" G_GUINT64_FORMAT " timed out", stream->window_id);
+  finish_stream (stream);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+connect_more_streams (ScreenCastThumbnailer *self)
+{
+  ThumbnailStream *stream;
+
+  while (self->n_active < MAX_ACTIVE_WINDOW_STREAMS &&
+         (stream = g_queue_pop_head (&self->streams_to_connect)))
+    {
+      connect_pw_stream (stream);
+      self->n_active++;
+      stream->timeout_id = g_timeout_add (WINDOW_STREAM_TIMEOUT_MS,
+                                          on_stream_timeout_cb,
+                                          stream);
+    }
+}
+
+/* The stream got its frame or gave up; free its slot for the next one */
+static void
+finish_stream (ThumbnailStream *stream)
+{
+  ScreenCastThumbnailer *self = stream->thumbnailer;
+
+  if (stream->finished)
+    return;
+
+  stream->finished = TRUE;
+  g_clear_handle_id (&stream->timeout_id, g_source_remove);
+  disconnect_pw_stream (stream);
+
+  if (self->n_active > 0)
+    self->n_active--;
+
+  if (self->n_pending > 0 && --self->n_pending == 0)
+    screen_cast_thumbnailer_stop (self);
+  else
+    connect_more_streams (self);
+}
+
+static void
+on_pipewire_stream_added (OrgGnomeMutterScreenCastStream *proxy,
+                          unsigned int                    node_id,
+                          ThumbnailStream                *stream)
+{
+  ScreenCastThumbnailer *self = stream->thumbnailer;
+
+  if (self->done || !self->pw_core || stream->finished || stream->node_id != SPA_ID_INVALID)
+    return;
+
+  stream->node_id = node_id;
+  g_queue_push_tail (&self->streams_to_connect, stream);
+  connect_more_streams (self);
+}
+
+static void
 thumbnail_stream_free (ThumbnailStream *stream)
 {
   /* PipeWire objects are torn down before streams are freed */
   g_assert (stream->pw_stream == NULL);
+
+  g_clear_handle_id (&stream->timeout_id, g_source_remove);
 
   if (stream->proxy)
     {
@@ -675,6 +785,7 @@ record_window (ScreenCastThumbnailer  *self,
   stream = g_new0 (ThumbnailStream, 1);
   stream->thumbnailer = self;
   stream->window_id = window_id;
+  stream->node_id = SPA_ID_INVALID;
   stream->proxy =
     org_gnome_mutter_screen_cast_stream_proxy_new_sync (connection,
                                                         G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
@@ -702,7 +813,7 @@ on_timeout_cb (gpointer user_data)
   ScreenCastThumbnailer *self = user_data;
 
   self->timeout_id = 0;
-  g_debug ("%u window thumbnails timed out", self->n_pending);
+  g_debug ("%u window thumbnails still pending, giving up", self->n_pending);
   screen_cast_thumbnailer_stop (self);
 
   return G_SOURCE_REMOVE;
@@ -774,7 +885,12 @@ start_session (ScreenCastThumbnailer  *self,
   if (!org_gnome_mutter_screen_cast_session_call_start_sync (self->session, NULL, error))
     return FALSE;
 
-  self->timeout_id = g_timeout_add (WINDOW_THUMBNAIL_TIMEOUT_MS, on_timeout_cb, self);
+  self->start_time = g_get_monotonic_time ();
+  self->timeout_id =
+    g_timeout_add (SESSION_EXTRA_TIMEOUT_MS +
+                   WINDOW_STREAM_TIMEOUT_MS * ((self->n_pending + MAX_ACTIVE_WINDOW_STREAMS - 1) /
+                                               MAX_ACTIVE_WINDOW_STREAMS),
+                   on_timeout_cb, self);
   return TRUE;
 }
 
@@ -784,6 +900,7 @@ release_session (ScreenCastThumbnailer *self)
   g_clear_handle_id (&self->timeout_id, g_source_remove);
 
   teardown_pipewire (self);
+  g_queue_clear (&self->streams_to_connect);
   g_ptr_array_set_size (self->streams, 0);
 
   if (self->session)
@@ -793,6 +910,7 @@ release_session (ScreenCastThumbnailer *self)
     }
 
   self->n_pending = 0;
+  self->n_active = 0;
 }
 
 /*
@@ -897,6 +1015,9 @@ screen_cast_thumbnailer_stop (ScreenCastThumbnailer *self)
     return;
 
   self->done = TRUE;
+  if (self->start_time)
+    g_debug ("Window thumbnails done after %" G_GINT64_FORMAT " ms",
+             (g_get_monotonic_time () - self->start_time) / 1000);
   release_session (self);
 
   if (self->started)
