@@ -68,6 +68,10 @@ typedef struct
   int width;
   int height;
   char *path;
+
+  int64_t queue_time;
+  int64_t send_time;
+  int64_t shell_done_time;
 } CaptureAreaData;
 
 /* GNOME Shell refuses a second screenshot request from a sender while one is
@@ -104,6 +108,14 @@ load_texture_in_thread (GTask        *task,
       return;
     }
 
+  g_debug ("Monitor thumbnail %dx%d+%d+%d (%dx%d): waited %" G_GINT64_FORMAT " ms, "
+           "GNOME Shell took %" G_GINT64_FORMAT " ms, decoding %" G_GINT64_FORMAT " ms",
+           data->width, data->height, data->x, data->y,
+           gdk_texture_get_width (texture), gdk_texture_get_height (texture),
+           (data->send_time - data->queue_time) / 1000,
+           (data->shell_done_time - data->send_time) / 1000,
+           (g_get_monotonic_time () - data->shell_done_time) / 1000);
+
   g_task_return_pointer (task, texture, g_object_unref);
 }
 
@@ -115,8 +127,10 @@ on_screenshot_area_finished (GObject      *source_object,
   g_autoptr(GTask) task = user_data;
   g_autoptr(GError) error = NULL;
   g_autofree char *filename_used = NULL;
+  CaptureAreaData *data = g_task_get_task_data (task);
   gboolean success;
 
+  data->shell_done_time = g_get_monotonic_time ();
   capture_in_progress = FALSE;
   capture_next_area ();
 
@@ -145,6 +159,7 @@ send_screenshot_area (GTask *task)
 {
   CaptureAreaData *data = g_task_get_task_data (task);
 
+  data->send_time = g_get_monotonic_time ();
   org_gnome_shell_screenshot_call_screenshot_area (shell_screenshot,
                                                    data->x,
                                                    data->y,
@@ -228,6 +243,7 @@ screen_cast_capture_area_async (const graphene_rect_t *area,
   data->y = round (area->origin.y);
   data->width = round (area->size.width);
   data->height = round (area->size.height);
+  data->queue_time = g_get_monotonic_time ();
   g_task_set_task_data (task, data, (GDestroyNotify) capture_area_data_free);
 
   /* GNOME Shell overwrites the file; creating it first reserves a unique name */

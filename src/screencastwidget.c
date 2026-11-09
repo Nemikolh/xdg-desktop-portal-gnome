@@ -72,6 +72,10 @@ struct _ScreenCastWidget
 
   GCancellable          *monitor_thumbnails_cancellable;
   ScreenCastThumbnailer *thumbnailer;
+
+  guint                  first_frame_tick_id;
+  unsigned int           n_ticks;
+  gboolean               first_frame_drawn;
 };
 
 static GQuark quark_monitor_widget_data;
@@ -79,6 +83,7 @@ static GQuark quark_monitor_widget_data;
 G_DEFINE_TYPE (ScreenCastWidget, screen_cast_widget, GTK_TYPE_BOX)
 
 static void schedule_selection_change (ScreenCastWidget *widget);
+static void maybe_start_window_thumbnails (ScreenCastWidget *self);
 
 /*
  * Auxiliary methods
@@ -323,10 +328,57 @@ capture_monitor_thumbnail (ScreenCastWidget          *self,
                            GtkWidget                 *monitor_button,
                            const MonitorIllustration *illustration)
 {
+  /* GNOME Shell paints and reads back the whole area synchronously, so let
+   * the dialog show up first; see on_first_frame_cb () */
+  if (!self->first_frame_drawn)
+    {
+      g_object_set_data_full (G_OBJECT (monitor_button), "capture-area",
+                              g_memdup2 (&illustration->rect, sizeof (graphene_rect_t)),
+                              g_free);
+      return;
+    }
+
   screen_cast_capture_area_async (&illustration->rect,
                                   self->monitor_thumbnails_cancellable,
                                   on_monitor_thumbnail_captured,
                                   g_object_ref (monitor_button));
+}
+
+static void
+capture_deferred_monitor_thumbnail (GtkWidget        *monitor_button,
+                                    ScreenCastWidget *self)
+{
+  graphene_rect_t *area = g_object_get_data (G_OBJECT (monitor_button), "capture-area");
+
+  if (!area || !self->monitor_thumbnails_cancellable)
+    return;
+
+  screen_cast_capture_area_async (area,
+                                  self->monitor_thumbnails_cancellable,
+                                  on_monitor_thumbnail_captured,
+                                  g_object_ref (monitor_button));
+  g_object_set_data (G_OBJECT (monitor_button), "capture-area", NULL);
+}
+
+static gboolean
+on_first_frame_cb (GtkWidget     *widget,
+                   GdkFrameClock *frame_clock,
+                   gpointer       user_data)
+{
+  ScreenCastWidget *self = SCREEN_CAST_WIDGET (widget);
+
+  /* Ticks run before painting, so the second one follows the first frame */
+  if (++self->n_ticks < 2)
+    return G_SOURCE_CONTINUE;
+
+  self->first_frame_tick_id = 0;
+  self->first_frame_drawn = TRUE;
+  foreach_widget_child (self->monitor_container,
+                        (GFunc) capture_deferred_monitor_thumbnail,
+                        self);
+  maybe_start_window_thumbnails (self);
+
+  return G_SOURCE_REMOVE;
 }
 
 static gboolean
@@ -516,8 +568,10 @@ maybe_start_window_thumbnails (ScreenCastWidget *self)
 {
   AdwViewStackPage *selected_page;
 
+  /* Setting up the session blocks, so the dialog gets drawn first */
   if (!self->source_types.window ||
       !gtk_widget_get_mapped (GTK_WIDGET (self)) ||
+      !self->first_frame_drawn ||
       screen_cast_thumbnailer_is_started (self->thumbnailer))
     return;
 
@@ -657,6 +711,7 @@ screen_cast_widget_finalize (GObject *object)
 static void
 screen_cast_widget_map (GtkWidget *widget)
 {
+  ScreenCastWidget *self = SCREEN_CAST_WIDGET (widget);
   static GtkCssProvider *provider = NULL;
 
   GTK_WIDGET_CLASS (screen_cast_widget_parent_class)->map (widget);
@@ -671,7 +726,25 @@ screen_cast_widget_map (GtkWidget *widget)
                                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
-  maybe_start_window_thumbnails (SCREEN_CAST_WIDGET (widget));
+  if (!self->first_frame_drawn && self->first_frame_tick_id == 0)
+    self->first_frame_tick_id = gtk_widget_add_tick_callback (widget, on_first_frame_cb, NULL, NULL);
+
+  maybe_start_window_thumbnails (self);
+}
+
+static void
+screen_cast_widget_unmap (GtkWidget *widget)
+{
+  ScreenCastWidget *self = SCREEN_CAST_WIDGET (widget);
+
+  if (self->first_frame_tick_id)
+    {
+      gtk_widget_remove_tick_callback (widget, self->first_frame_tick_id);
+      self->first_frame_tick_id = 0;
+      self->n_ticks = 0;
+    }
+
+  GTK_WIDGET_CLASS (screen_cast_widget_parent_class)->unmap (widget);
 }
 
 static void
@@ -692,6 +765,7 @@ screen_cast_widget_class_init (ScreenCastWidgetClass *klass)
 
   object_class->finalize = screen_cast_widget_finalize;
   widget_class->map = screen_cast_widget_map;
+  widget_class->unmap = screen_cast_widget_unmap;
   widget_class->root = screen_cast_widget_root;
 
   signals[HAS_SELECTION_CHANGED] = g_signal_new ("has-selection-changed",
