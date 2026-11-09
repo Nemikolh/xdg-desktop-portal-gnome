@@ -494,7 +494,7 @@ scale_down_texture (ScreenCastThumbnailer *self,
   int texture_width = gdk_texture_get_width (texture);
   int texture_height = gdk_texture_get_height (texture);
   gboolean cropped;
-  double scale;
+  double scale, scale_x, scale_y;
   int scaled_width, scaled_height;
 
   cropped = x != 0 || y != 0 || width != texture_width || height != texture_height;
@@ -510,11 +510,16 @@ scale_down_texture (ScreenCastThumbnailer *self,
   scaled_width = MAX (1, (int) round (width * scale));
   scaled_height = MAX (1, (int) round (height * scale));
 
+  /* Per axis, so the rounded size is covered exactly, without a partially
+   * transparent last row or column */
+  scale_x = (double) scaled_width / width;
+  scale_y = (double) scaled_height / height;
+
   node = gsk_texture_scale_node_new (texture,
-                                     &GRAPHENE_RECT_INIT (-x * scale,
-                                                          -y * scale,
-                                                          texture_width * scale,
-                                                          texture_height * scale),
+                                     &GRAPHENE_RECT_INIT (-x * scale_x,
+                                                          -y * scale_y,
+                                                          texture_width * scale_x,
+                                                          texture_height * scale_y),
                                      GSK_SCALING_FILTER_TRILINEAR);
 
   scaled = gsk_renderer_render_texture (self->renderer,
