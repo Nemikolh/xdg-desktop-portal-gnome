@@ -87,6 +87,7 @@ deps = [
   dependency('gnome-desktop-4'),
   dependency('gnome-bg-4'),
   dependency('libgxdp'),
+  dependency('libpipewire-0.3'),
   libadwaita_dep,
   xdg_desktop_portal_dep,
 ]
@@ -119,6 +120,8 @@ sources = built_sources + files(
   'screenshotdialog.c',
   'screencast.c',
   'screencastgeometrycontainer.c',
+  'screencastthumbnail.c',
+  'screencastthumbnailview.c',
   'screencastwidget.c',
   'screencastdialog.c',
   'session.c',

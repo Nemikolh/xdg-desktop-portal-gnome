@@ -23,24 +23,54 @@ geometry-container.singular {
   border: 3px @accent_bg_color solid;
 }
 
-.monitor > .text {
+.monitor > overlay {
+  border-radius: 7px;
+}
+
+.monitor > overlay > .text {
   font-weight: normal;
   padding: .5em;
   border-radius: 7px;
   background-color: @monitor_button_bg;
 }
 
-.monitor.primary > .text {
+.monitor.primary > overlay > .text {
   border-top: 8.5px black solid;
 }
 
-.monitor:hover > .text {
+.monitor:hover > overlay > .text {
   background-color: @monitor_button_hover_bg;
 }
 
-.monitor.keyboard-activating > .text,
-.monitor:active > .text {
+.monitor.keyboard-activating > overlay > .text,
+.monitor:active > overlay > .text {
   background-color: @monitor_button_active_bg;
+}
+
+/* With a thumbnail the label becomes a caption bar along the bottom */
+.monitor.primary.has-thumbnail > overlay {
+  border-top: 8.5px black solid;
+}
+
+.monitor.has-thumbnail > overlay > .text {
+  border-top: none;
+  border-radius: 0;
+  color: white;
+  background-color: alpha(black, 0.6);
+}
+
+.monitor.has-thumbnail:hover > overlay > .text {
+  background-color: alpha(black, 0.5);
+}
+
+.monitor.has-thumbnail.keyboard-activating > overlay > .text,
+.monitor.has-thumbnail:active > overlay > .text {
+  background-color: alpha(black, 0.7);
+}
+
+.window-thumbnail {
+  border-radius: 6px;
+  background-color: alpha(currentColor, 0.08);
 }
 
 .window-selected {

@@ -27,6 +27,8 @@
 #include "gtk/gtkcssprovider.h"
 #include "screencastgeometrycontainer.h"
 #include "screencast.h"
+#include "screencastthumbnail.h"
+#include "screencastthumbnailview.h"
 #include "shellintrospect.h"
 
 enum
@@ -67,6 +69,9 @@ struct _ScreenCastWidget
   ScreenCastSourceTypes  source_types;
 
   GtkCssProvider        *colors_provider;
+
+  GCancellable          *monitor_thumbnails_cancellable;
+  ScreenCastThumbnailer *thumbnailer;
 };
 
 static GQuark quark_monitor_widget_data;
@@ -79,12 +84,35 @@ static void schedule_selection_change (ScreenCastWidget *widget);
  * Auxiliary methods
  */
 
+static void
+update_row_thumbnail (GtkWidget        *row,
+                      ScreenCastWidget *self)
+{
+  GtkWidget *thumbnail = g_object_get_data (G_OBJECT (row), "thumbnail");
+  uint64_t *window_id = g_object_get_data (G_OBJECT (row), "window-id");
+  GdkTexture *texture;
+
+  if (!thumbnail || !window_id)
+    return;
+
+  texture = screen_cast_thumbnailer_lookup (self->thumbnailer, *window_id);
+  screen_cast_thumbnail_view_set_texture (SCREEN_CAST_THUMBNAIL_VIEW (thumbnail), texture);
+
+  /* Keep the placeholder while a frame may still arrive */
+  gtk_widget_set_visible (thumbnail,
+                          texture != NULL ||
+                          !screen_cast_thumbnailer_is_done (self->thumbnailer));
+}
+
 static GtkWidget *
-create_window_widget (ShellWindow *window)
+create_window_widget (ShellWindow      *window,
+                      ScreenCastWidget *self)
 {
   GtkWidget *window_image;
   GtkWidget *check_image;
+  GtkWidget *thumbnail;
   GtkWidget *row;
+  uint64_t window_id;
   g_autoptr(GIcon) icon = NULL;
   g_autoptr(GDesktopAppInfo) info = NULL;
 
@@ -98,10 +126,16 @@ create_window_widget (ShellWindow *window)
   window_image = gtk_image_new_from_gicon (icon);
   gtk_image_set_pixel_size (GTK_IMAGE (window_image), 32);
 
+  thumbnail = screen_cast_thumbnail_view_new (GTK_CONTENT_FIT_CONTAIN);
+  gtk_widget_set_size_request (thumbnail, 96, 54);
+  gtk_widget_set_valign (thumbnail, GTK_ALIGN_CENTER);
+  gtk_widget_add_css_class (thumbnail, "window-thumbnail");
+
   check_image = gtk_image_new_from_icon_name ("object-select-symbolic");
   gtk_widget_set_visible (check_image, FALSE);
 
   row = adw_action_row_new ();
+  adw_action_row_add_prefix (ADW_ACTION_ROW (row), thumbnail);
   adw_action_row_add_prefix (ADW_ACTION_ROW (row), window_image);
   adw_action_row_add_suffix (ADW_ACTION_ROW (row), check_image);
   gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), TRUE);
@@ -110,6 +144,13 @@ create_window_widget (ShellWindow *window)
   g_object_bind_property (window, "title", row, "title", G_BINDING_SYNC_CREATE);
 
   g_object_set_data (G_OBJECT (row), "check", check_image);
+  g_object_set_data (G_OBJECT (row), "thumbnail", thumbnail);
+  window_id = shell_window_get_id (window);
+  g_object_set_data_full (G_OBJECT (row), "window-id",
+                          g_memdup2 (&window_id, sizeof (window_id)),
+                          g_free);
+
+  update_row_thumbnail (row, self);
   return row;
 }
 
@@ -170,6 +211,8 @@ create_monitor_button (Monitor *monitor, const MonitorIllustration *monitor_illu
 {
   GtkWidget *button;
   GtkWidget *inscription;
+  GtkWidget *overlay;
+  GtkWidget *thumbnail;
 
   inscription = gtk_inscription_new (monitor_illustration->label);
   gtk_inscription_set_text_overflow (GTK_INSCRIPTION (inscription), GTK_INSCRIPTION_OVERFLOW_ELLIPSIZE_END);
@@ -179,8 +222,17 @@ create_monitor_button (Monitor *monitor, const MonitorIllustration *monitor_illu
   gtk_widget_set_valign (inscription, GTK_ALIGN_FILL);
   gtk_widget_add_css_class (inscription, "text");
 
+  thumbnail = screen_cast_thumbnail_view_new (GTK_CONTENT_FIT_COVER);
+
+  overlay = gtk_overlay_new ();
+  gtk_widget_set_overflow (overlay, GTK_OVERFLOW_HIDDEN);
+  gtk_overlay_set_child (GTK_OVERLAY (overlay), thumbnail);
+  gtk_overlay_add_overlay (GTK_OVERLAY (overlay), inscription);
+  /* The thumbnail requests no size, the label sizes the button */
+  gtk_overlay_set_measure_overlay (GTK_OVERLAY (overlay), inscription, TRUE);
+
   button = gtk_toggle_button_new ();
-  gtk_button_set_child ( GTK_BUTTON (button), inscription);
+  gtk_button_set_child ( GTK_BUTTON (button), overlay);
   gtk_widget_add_css_class (button, "monitor");
   if (monitor_illustration->primary)
     gtk_widget_add_css_class (button, "primary");
@@ -191,8 +243,48 @@ create_monitor_button (Monitor *monitor, const MonitorIllustration *monitor_illu
                            quark_monitor_widget_data,
                            monitor ? monitor_dup (monitor) : NULL,
                            (GDestroyNotify) monitor_free);
+  g_object_set_data (G_OBJECT (button), "thumbnail", thumbnail);
+  g_object_set_data (G_OBJECT (button), "label", inscription);
 
   return button;
+}
+
+static void
+on_monitor_thumbnail_captured (GObject      *source_object,
+                               GAsyncResult *result,
+                               gpointer      user_data)
+{
+  g_autoptr(GtkWidget) button = user_data;
+  g_autoptr(GdkTexture) texture = NULL;
+  g_autoptr(GError) error = NULL;
+  GtkWidget *thumbnail;
+  GtkWidget *label;
+
+  texture = screen_cast_capture_area_finish (result, &error);
+  if (!texture)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("Failed to capture monitor thumbnail: %s", error->message);
+      return;
+    }
+
+  thumbnail = g_object_get_data (G_OBJECT (button), "thumbnail");
+  label = g_object_get_data (G_OBJECT (button), "label");
+
+  screen_cast_thumbnail_view_set_texture (SCREEN_CAST_THUMBNAIL_VIEW (thumbnail), texture);
+  gtk_widget_set_valign (label, GTK_ALIGN_END);
+  gtk_widget_add_css_class (button, "has-thumbnail");
+}
+
+static void
+capture_monitor_thumbnail (ScreenCastWidget          *self,
+                           GtkWidget                 *monitor_button,
+                           const MonitorIllustration *illustration)
+{
+  screen_cast_capture_area_async (&illustration->rect,
+                                  self->monitor_thumbnails_cancellable,
+                                  on_monitor_thumbnail_captured,
+                                  g_object_ref (monitor_button));
 }
 
 static gboolean
@@ -253,6 +345,12 @@ update_monitor_container (ScreenCastWidget *widget)
 
   monitor_container = widget->monitor_container;
 
+  g_cancellable_cancel (widget->monitor_thumbnails_cancellable);
+  g_clear_object (&widget->monitor_thumbnails_cancellable);
+  /* Not rooted yet means not about to be shown; root () updates again */
+  if (gtk_widget_get_root (GTK_WIDGET (widget)))
+    widget->monitor_thumbnails_cancellable = g_cancellable_new ();
+
   /* Clear monitor container */
   screen_cast_geometry_container_remove_all (SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container));
 
@@ -281,6 +379,9 @@ update_monitor_container (ScreenCastWidget *widget)
           screen_cast_geometry_container_add (SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container),
                                               monitor_button,
                                               &illustration->rect);
+
+          if (widget->monitor_thumbnails_cancellable)
+            capture_monitor_thumbnail (widget, monitor_button, illustration);
         }
   }
 
@@ -369,11 +470,38 @@ reset_selection (ScreenCastWidget *self)
 }
 
 static void
+maybe_start_window_thumbnails (ScreenCastWidget *self)
+{
+  AdwViewStackPage *selected_page;
+
+  if (!self->source_types.window ||
+      !gtk_widget_get_mapped (GTK_WIDGET (self)) ||
+      screen_cast_thumbnailer_is_started (self->thumbnailer))
+    return;
+
+  /* Recording windows makes GNOME Shell show its screen sharing indicator,
+   * so only do so once the window list is actually shown. */
+  selected_page = adw_view_stack_pages_get_selected_page (
+          ADW_VIEW_STACK_PAGES (adw_view_stack_get_pages (ADW_VIEW_STACK (self->source_type))));
+  if (selected_page != ADW_VIEW_STACK_PAGE (self->window_selection_page))
+    return;
+
+  screen_cast_thumbnailer_start (self->thumbnailer, self->filter_model);
+}
+
+static void
+on_window_thumbnails_changed (ScreenCastWidget *self)
+{
+  foreach_widget_child (self->window_list, (GFunc) update_row_thumbnail, self);
+}
+
+static void
 on_stack_switch (ScreenCastWidget *self,
                  GParamSpec *pspec,
                  AdwViewStack   *stack)
 {
   reset_selection (self);
+  maybe_start_window_thumbnails (self);
 }
 
 static void
@@ -471,6 +599,14 @@ screen_cast_widget_finalize (GObject *object)
 
   g_clear_object (&widget->colors_provider);
 
+  g_cancellable_cancel (widget->monitor_thumbnails_cancellable);
+  g_clear_object (&widget->monitor_thumbnails_cancellable);
+
+  /* Rows are gone by now; don't get told about the final "done" */
+  g_signal_handlers_disconnect_by_data (widget->thumbnailer, widget);
+  screen_cast_thumbnailer_stop (widget->thumbnailer);
+  g_clear_object (&widget->thumbnailer);
+
   G_OBJECT_CLASS (screen_cast_widget_parent_class)->finalize (object);
 }
 static void
@@ -489,6 +625,8 @@ screen_cast_widget_map (GtkWidget *widget)
                                                   GTK_STYLE_PROVIDER (provider),
                                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
+
+  maybe_start_window_thumbnails (SCREEN_CAST_WIDGET (widget));
 }
 
 static void
@@ -555,6 +693,9 @@ screen_cast_widget_init (ScreenCastWidget *widget)
 
   widget->selection_changed_timeout_id = 0;
 
+  /* Before the setters below, which reach code that consults it */
+  widget->thumbnailer = screen_cast_thumbnailer_new ();
+
   gtk_widget_init_template (GTK_WIDGET (widget));
 
   screen_cast_widget_set_app_id (widget, NULL);
@@ -593,7 +734,12 @@ screen_cast_widget_init (ScreenCastWidget *widget)
   gtk_list_box_bind_model (GTK_LIST_BOX (widget->window_list),
                            widget->filter_model,
                            (GtkListBoxCreateWidgetFunc) create_window_widget,
-                           NULL, NULL);
+                           widget, NULL);
+
+  g_object_connect (widget->thumbnailer,
+                    "swapped-signal::thumbnail-ready", G_CALLBACK (on_window_thumbnails_changed), widget,
+                    "swapped-signal::done", G_CALLBACK (on_window_thumbnails_changed), widget,
+                    NULL);
 
   g_signal_connect_swapped (widget->filter_model,
                             "items-changed",
