@@ -18,7 +18,9 @@
 
 #include "config.h"
 
+#include <drm/drm_fourcc.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glib/gstdio.h>
 #include <math.h>
 #include <pipewire/pipewire.h>
@@ -32,10 +34,22 @@
 
 /* With shared memory buffers Mutter reads each window frame back from the GPU
  * synchronously on its main thread, stalling the whole compositor; recording
- * every window at once froze the desktop for seconds. Mutter only renders a
+ * every window at once froze the desktop for seconds. DMA-BUFs avoid the
+ * readback, but shared memory stays the fallback. Mutter only renders a
  * stream while a consumer streams from it, so we bound that by connecting to
  * a few windows at a time. */
 #define MAX_ACTIVE_WINDOW_STREAMS 2
+
+/* Mutter re-records a window on every damage, up to the negotiated maximum
+ * frame rate, until the stream pauses; one frame is all we need */
+#define WINDOW_STREAM_MAX_FRAMERATE 5
+
+/* Thumbnails are kept at most this large, in pixels; cards are much smaller,
+ * so this leaves room for scaled displays */
+#define THUMBNAIL_MAX_WIDTH 480
+#define THUMBNAIL_MAX_HEIGHT 320
+
+#define MAX_DMABUF_PLANES 4
 
 /* How long one window stream gets to deliver its first frame */
 #define WINDOW_STREAM_TIMEOUT_MS 1000
@@ -275,17 +289,40 @@ typedef struct
   struct spa_hook pw_stream_listener;
   struct spa_video_info_raw format;
   gboolean has_format;
+  gboolean dmabuf;
   gboolean captured;
 } ThumbnailStream;
 
 typedef struct
 {
+  uint32_t fourcc;
+  uint64_t modifier;
+  unsigned int width;
+  unsigned int height;
+  unsigned int n_planes;
+  int fds[MAX_DMABUF_PLANES];
+  uint32_t offsets[MAX_DMABUF_PLANES];
+  uint32_t strides[MAX_DMABUF_PLANES];
+} ThumbnailDmabuf;
+
+typedef struct
+{
   ScreenCastThumbnailer *thumbnailer;
   uint64_t window_id;
-  GBytes *bytes;
+  int64_t capture_time;
+
+  /* Visible area of the frame */
+  int x;
+  int y;
   int width;
   int height;
+
+  /* Shared memory frames are already cropped to the visible area */
+  GBytes *bytes;
   GdkMemoryFormat format;
+
+  /* DMA-BUF frames hold their own file descriptors */
+  ThumbnailDmabuf *dmabuf;
 } ThumbnailFrame;
 
 struct _ScreenCastThumbnailer
@@ -300,6 +337,9 @@ struct _ScreenCastThumbnailer
   struct pw_thread_loop *pw_loop;
   struct pw_context *pw_context;
   struct pw_core *pw_core;
+
+  GskRenderer *renderer;
+  gboolean dmabuf_failed;
 
   unsigned int n_pending;
   unsigned int n_active;
@@ -340,37 +380,188 @@ gdk_format_from_spa_format (uint32_t         spa_format,
   return TRUE;
 }
 
+static gboolean
+drm_fourcc_from_spa_format (uint32_t  spa_format,
+                            uint32_t *fourcc)
+{
+  switch (spa_format)
+    {
+    case SPA_VIDEO_FORMAT_BGRx:
+      *fourcc = DRM_FORMAT_XRGB8888;
+      return TRUE;
+    case SPA_VIDEO_FORMAT_BGRA:
+      *fourcc = DRM_FORMAT_ARGB8888;
+      return TRUE;
+    case SPA_VIDEO_FORMAT_RGBx:
+      *fourcc = DRM_FORMAT_XBGR8888;
+      return TRUE;
+    case SPA_VIDEO_FORMAT_RGBA:
+      *fourcc = DRM_FORMAT_ABGR8888;
+      return TRUE;
+    default:
+      return FALSE;
+    }
+}
+
+static void
+thumbnail_dmabuf_free (ThumbnailDmabuf *dmabuf)
+{
+  unsigned int i;
+
+  for (i = 0; i < dmabuf->n_planes; i++)
+    g_clear_fd (&dmabuf->fds[i], NULL);
+  g_free (dmabuf);
+}
+
 static void
 thumbnail_frame_free (ThumbnailFrame *frame)
 {
   g_clear_object (&frame->thumbnailer);
   g_clear_pointer (&frame->bytes, g_bytes_unref);
+  g_clear_pointer (&frame->dmabuf, thumbnail_dmabuf_free);
   g_free (frame);
 }
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (ThumbnailFrame, thumbnail_frame_free)
+
 static void finish_stream (ThumbnailStream *stream);
+static void retry_stream (ThumbnailStream *stream);
+
+static GdkTexture *
+import_dmabuf (ThumbnailDmabuf  *dmabuf,
+               GError          **error)
+{
+  g_autoptr(GdkDmabufTextureBuilder) builder = NULL;
+  GdkTexture *texture;
+  unsigned int i;
+
+  builder = gdk_dmabuf_texture_builder_new ();
+  gdk_dmabuf_texture_builder_set_display (builder, gdk_display_get_default ());
+  gdk_dmabuf_texture_builder_set_width (builder, dmabuf->width);
+  gdk_dmabuf_texture_builder_set_height (builder, dmabuf->height);
+  gdk_dmabuf_texture_builder_set_fourcc (builder, dmabuf->fourcc);
+  gdk_dmabuf_texture_builder_set_modifier (builder, dmabuf->modifier);
+  gdk_dmabuf_texture_builder_set_premultiplied (builder, TRUE);
+  gdk_dmabuf_texture_builder_set_n_planes (builder, dmabuf->n_planes);
+  for (i = 0; i < dmabuf->n_planes; i++)
+    {
+      gdk_dmabuf_texture_builder_set_fd (builder, i, dmabuf->fds[i]);
+      gdk_dmabuf_texture_builder_set_offset (builder, i, dmabuf->offsets[i]);
+      gdk_dmabuf_texture_builder_set_stride (builder, i, dmabuf->strides[i]);
+    }
+
+  /* On success the texture owns the file descriptors */
+  texture = gdk_dmabuf_texture_builder_build (builder,
+                                              (GDestroyNotify) thumbnail_dmabuf_free,
+                                              dmabuf,
+                                              error);
+  return texture;
+}
+
+/* Renders the visible @area of @texture into a small texture, so neither the
+ * full-size frame nor its DMA-BUF have to be kept around for the dialog. */
+static GdkTexture *
+scale_down_texture (ScreenCastThumbnailer *self,
+                    GdkTexture            *texture,
+                    int                    x,
+                    int                    y,
+                    int                    width,
+                    int                    height)
+{
+  g_autoptr(GskRenderNode) node = NULL;
+  GdkTexture *scaled;
+  int texture_width = gdk_texture_get_width (texture);
+  int texture_height = gdk_texture_get_height (texture);
+  gboolean cropped;
+  double scale;
+  int scaled_width, scaled_height;
+
+  cropped = x != 0 || y != 0 || width != texture_width || height != texture_height;
+  scale = MIN (1.0, MIN ((double) THUMBNAIL_MAX_WIDTH / width,
+                         (double) THUMBNAIL_MAX_HEIGHT / height));
+
+  if (!self->renderer || !gsk_renderer_is_realized (self->renderer))
+    return g_object_ref (texture);
+
+  if (scale == 1.0 && !cropped && GDK_IS_MEMORY_TEXTURE (texture))
+    return g_object_ref (texture);
+
+  scaled_width = MAX (1, (int) round (width * scale));
+  scaled_height = MAX (1, (int) round (height * scale));
+
+  node = gsk_texture_scale_node_new (texture,
+                                     &GRAPHENE_RECT_INIT (-x * scale,
+                                                          -y * scale,
+                                                          texture_width * scale,
+                                                          texture_height * scale),
+                                     GSK_SCALING_FILTER_TRILINEAR);
+
+  scaled = gsk_renderer_render_texture (self->renderer,
+                                        node,
+                                        &GRAPHENE_RECT_INIT (0, 0,
+                                                             scaled_width,
+                                                             scaled_height));
+  return scaled ? scaled : g_object_ref (texture);
+}
 
 static gboolean
 deliver_frame_cb (gpointer user_data)
 {
   ThumbnailFrame *frame = user_data;
   ScreenCastThumbnailer *self = frame->thumbnailer;
+  g_autoptr(GdkTexture) full_texture = NULL;
   g_autoptr(GdkTexture) texture = NULL;
+  g_autoptr(GError) error = NULL;
+  int64_t start_time = g_get_monotonic_time ();
+  gboolean retry = FALSE;
   unsigned int i;
 
-  texture = gdk_memory_texture_new (frame->width,
-                                    frame->height,
-                                    frame->format,
-                                    frame->bytes,
-                                    frame->width * 4);
+  if (frame->dmabuf)
+    {
+      full_texture = import_dmabuf (frame->dmabuf, &error);
+      if (full_texture)
+        {
+          frame->dmabuf = NULL;
+        }
+      else
+        {
+          /* Shared memory still works, for this window and the ones left */
+          g_debug ("Failed to import window thumbnail DMA-BUF, falling back to shared memory: %s",
+                   error->message);
+          self->dmabuf_failed = TRUE;
+          retry = TRUE;
+        }
+    }
+  else
+    {
+      full_texture = gdk_memory_texture_new (frame->width,
+                                             frame->height,
+                                             frame->format,
+                                             frame->bytes,
+                                             frame->width * 4);
+    }
 
-  g_hash_table_insert (self->textures,
-                       g_memdup2 (&frame->window_id, sizeof (frame->window_id)),
-                       g_object_ref (texture));
-  g_debug ("Window thumbnail %" G_GUINT64_FORMAT " (%dx%d) after %" G_GINT64_FORMAT " ms",
-           frame->window_id, frame->width, frame->height,
-           (g_get_monotonic_time () - self->start_time) / 1000);
-  g_signal_emit (self, signals[THUMBNAIL_READY], 0, frame->window_id, texture);
+  if (full_texture)
+    {
+      texture = scale_down_texture (self, full_texture,
+                                    frame->x, frame->y,
+                                    frame->width, frame->height);
+      g_clear_object (&full_texture);
+
+      g_hash_table_insert (self->textures,
+                           g_memdup2 (&frame->window_id, sizeof (frame->window_id)),
+                           g_object_ref (texture));
+      g_debug ("Window thumbnail %" G_GUINT64_FORMAT " (%dx%d, %s, scaled to %dx%d) "
+               "after %" G_GINT64_FORMAT " ms, %" G_GINT64_FORMAT " ms from capture, "
+               "%" G_GINT64_FORMAT " us to import and scale",
+               frame->window_id, frame->width, frame->height,
+               frame->bytes ? "shm" : "dmabuf",
+               gdk_texture_get_width (texture), gdk_texture_get_height (texture),
+               (g_get_monotonic_time () - self->start_time) / 1000,
+               (start_time - frame->capture_time) / 1000,
+               g_get_monotonic_time () - start_time);
+      g_signal_emit (self, signals[THUMBNAIL_READY], 0, frame->window_id, texture);
+    }
 
   /* Streams are gone if the thumbnailer stopped meanwhile */
   for (i = 0; i < self->streams->len; i++)
@@ -379,7 +570,10 @@ deliver_frame_cb (gpointer user_data)
 
       if (stream->window_id == frame->window_id)
         {
-          finish_stream (stream);
+          if (retry)
+            retry_stream (stream);
+          else
+            finish_stream (stream);
           break;
         }
     }
@@ -388,26 +582,94 @@ deliver_frame_cb (gpointer user_data)
 }
 
 /* Called on the PipeWire thread */
+static void
+copy_shm_frame (ThumbnailFrame        *frame,
+                const struct spa_data *data,
+                uint32_t               stride)
+{
+  const uint8_t *src = (const uint8_t *) data->data + data->chunk->offset;
+  uint8_t *pixels;
+  int row;
+
+  pixels = g_malloc ((gsize) frame->width * frame->height * 4);
+  for (row = 0; row < frame->height; row++)
+    {
+      memcpy (pixels + (gsize) row * frame->width * 4,
+              src + (gsize) (frame->y + row) * stride + (gsize) frame->x * 4,
+              (gsize) frame->width * 4);
+    }
+
+  frame->bytes = g_bytes_new_take (pixels, (gsize) frame->width * frame->height * 4);
+  frame->x = 0;
+  frame->y = 0;
+}
+
+/* Called on the PipeWire thread */
+static ThumbnailDmabuf *
+dup_dmabuf (ThumbnailStream   *stream,
+            struct spa_buffer *buffer)
+{
+  ThumbnailDmabuf *dmabuf;
+  unsigned int i;
+
+  if (buffer->n_datas == 0 || buffer->n_datas > MAX_DMABUF_PLANES)
+    return NULL;
+
+  dmabuf = g_new0 (ThumbnailDmabuf, 1);
+  dmabuf->modifier = stream->format.modifier;
+  dmabuf->width = stream->format.size.width;
+  dmabuf->height = stream->format.size.height;
+  if (!drm_fourcc_from_spa_format (stream->format.format, &dmabuf->fourcc))
+    goto fail;
+
+  for (i = 0; i < buffer->n_datas; i++)
+    {
+      const struct spa_data *data = &buffer->datas[i];
+
+      if (data->type != SPA_DATA_DmaBuf || data->fd < 0 || !data->chunk)
+        goto fail;
+
+      /* Our own references keep the buffer contents alive after the stream
+       * is gone, so the PipeWire buffer can go back to Mutter right away */
+      dmabuf->fds[i] = fcntl (data->fd, F_DUPFD_CLOEXEC, 3);
+      if (dmabuf->fds[i] < 0)
+        goto fail;
+      dmabuf->n_planes++;
+
+      dmabuf->offsets[i] = data->chunk->offset;
+      dmabuf->strides[i] = data->chunk->stride > 0 ? (uint32_t) data->chunk->stride
+                                                    : dmabuf->width * 4;
+    }
+
+  return dmabuf;
+
+fail:
+  thumbnail_dmabuf_free (dmabuf);
+  return NULL;
+}
+
+/* Called on the PipeWire thread */
 static gboolean
 capture_frame (ThumbnailStream    *stream,
                struct spa_buffer  *buffer)
 {
+  g_autoptr(ThumbnailFrame) frame = NULL;
   struct spa_meta_header *header;
   struct spa_meta_region *crop;
   struct spa_data *data;
-  ThumbnailFrame *frame;
   GdkMemoryFormat gdk_format;
-  uint32_t x = 0, y = 0, width, height, stride, row;
-  const uint8_t *src;
-  uint8_t *pixels;
+  uint32_t x = 0, y = 0, width, height;
 
   header = spa_buffer_find_meta_data (buffer, SPA_META_Header, sizeof (*header));
   if (header && (header->flags & SPA_META_HEADER_FLAG_CORRUPTED))
     return FALSE;
 
   data = &buffer->datas[0];
-  if (!data->data || !data->chunk || data->chunk->size == 0 ||
+  if (!data->chunk || data->chunk->size == 0 ||
       (data->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED))
+    return FALSE;
+
+  if (data->type == SPA_DATA_DmaBuf ? !stream->dmabuf : !data->data)
     return FALSE;
 
   if (!gdk_format_from_spa_format (stream->format.format, &gdk_format))
@@ -431,34 +693,38 @@ capture_frame (ThumbnailStream    *stream,
   if (width == 0 || height == 0)
     return FALSE;
 
-  stride = data->chunk->stride > 0 ? (uint32_t) data->chunk->stride
-                                   : stream->format.size.width * 4;
-
-  if (data->chunk->offset > data->maxsize ||
-      (uint64_t) (y + height - 1) * stride + (uint64_t) (x + width) * 4 >
-      data->maxsize - data->chunk->offset)
-    return FALSE;
-
-  src = (const uint8_t *) data->data + data->chunk->offset;
-  pixels = g_malloc ((gsize) width * height * 4);
-  for (row = 0; row < height; row++)
-    {
-      memcpy (pixels + (gsize) row * width * 4,
-              src + (gsize) (y + row) * stride + (gsize) x * 4,
-              (gsize) width * 4);
-    }
-
   frame = g_new0 (ThumbnailFrame, 1);
   frame->thumbnailer = g_object_ref (stream->thumbnailer);
   frame->window_id = stream->window_id;
-  frame->bytes = g_bytes_new_take (pixels, (gsize) width * height * 4);
+  frame->capture_time = g_get_monotonic_time ();
+  frame->x = x;
+  frame->y = y;
   frame->width = width;
   frame->height = height;
   frame->format = gdk_format;
 
+  if (data->type == SPA_DATA_DmaBuf)
+    {
+      frame->dmabuf = dup_dmabuf (stream, buffer);
+      if (!frame->dmabuf)
+        return FALSE;
+    }
+  else
+    {
+      uint32_t stride = data->chunk->stride > 0 ? (uint32_t) data->chunk->stride
+                                                : stream->format.size.width * 4;
+
+      if (data->chunk->offset > data->maxsize ||
+          (uint64_t) (y + height - 1) * stride + (uint64_t) (x + width) * 4 >
+          data->maxsize - data->chunk->offset)
+        return FALSE;
+
+      copy_shm_frame (frame, data, stride);
+    }
+
   g_idle_add_full (G_PRIORITY_DEFAULT,
                    deliver_frame_cb,
-                   frame,
+                   g_steal_pointer (&frame),
                    (GDestroyNotify) thumbnail_frame_free);
 
   return TRUE;
@@ -503,10 +769,14 @@ on_pw_stream_param_changed (void                 *user_data,
   struct spa_pod_builder builder =
     SPA_POD_BUILDER_INIT (params_buffer, sizeof (params_buffer));
   const struct spa_pod *params[3];
+  const struct spa_pod_prop *modifier;
   uint32_t media_type, media_subtype;
+  uint32_t data_types;
 
   if (!param || id != SPA_PARAM_Format)
     return;
+
+  stream->has_format = FALSE;
 
   if (spa_format_parse (param, &media_type, &media_subtype) < 0 ||
       media_type != SPA_MEDIA_TYPE_video ||
@@ -517,15 +787,34 @@ on_pw_stream_param_changed (void                 *user_data,
       !gdk_format_from_spa_format (stream->format.format, NULL))
     return;
 
+  modifier = spa_pod_find_prop (param, NULL, SPA_FORMAT_VIDEO_modifier);
+
+  /* Mutter picks one of the modifiers and renegotiates with it */
+  if (modifier && (modifier->flags & SPA_POD_PROP_FLAG_DONT_FIXATE))
+    return;
+
+  stream->dmabuf = modifier != NULL;
   stream->has_format = TRUE;
 
-  /* Shared memory only: no DMA-BUF, so no GPU readback is needed */
+  g_debug ("Window thumbnail %" G_GUINT64_FORMAT ": %ux%u, %s, modifier 0x%" G_GINT64_MODIFIER "x, "
+           "max %u/%u fps",
+           stream->window_id,
+           stream->format.size.width, stream->format.size.height,
+           stream->dmabuf ? "dmabuf" : "shm",
+           stream->dmabuf ? stream->format.modifier : 0,
+           stream->format.max_framerate.num, stream->format.max_framerate.denom);
+
+  /* With shared memory, Mutter reads every frame back from the GPU */
+  if (stream->dmabuf)
+    data_types = 1 << SPA_DATA_DmaBuf;
+  else
+    data_types = (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd);
+
   /* Mutter defaults to 8 window-sized buffers; one frame needs the minimum */
   params[0] = spa_pod_builder_add_object (&builder,
     SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
     SPA_PARAM_BUFFERS_buffers, SPA_POD_Int (2),
-    SPA_PARAM_BUFFERS_dataType, SPA_POD_Int ((1 << SPA_DATA_MemPtr) |
-                                             (1 << SPA_DATA_MemFd)));
+    SPA_PARAM_BUFFERS_dataType, SPA_POD_Int (data_types));
   params[1] = spa_pod_builder_add_object (&builder,
     SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
     SPA_PARAM_META_type, SPA_POD_Id (SPA_META_Header),
@@ -544,18 +833,116 @@ static const struct pw_stream_events pw_stream_events = {
   .process = on_pw_stream_process,
 };
 
+static const uint32_t window_stream_formats[] = {
+  SPA_VIDEO_FORMAT_BGRx,
+  SPA_VIDEO_FORMAT_BGRA,
+  SPA_VIDEO_FORMAT_RGBx,
+  SPA_VIDEO_FORMAT_RGBA,
+};
+
+static void
+add_common_format_props (struct spa_pod_builder *builder)
+{
+  spa_pod_builder_add (builder,
+    SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle (&SPA_RECTANGLE (320, 240),
+                                                           &SPA_RECTANGLE (1, 1),
+                                                           &SPA_RECTANGLE (16384, 16384)),
+    SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction (&SPA_FRACTION (0, 1),
+                                                               &SPA_FRACTION (0, 1),
+                                                               &SPA_FRACTION (360, 1)),
+    SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_CHOICE_RANGE_Fraction (&SPA_FRACTION (WINDOW_STREAM_MAX_FRAMERATE, 1),
+                                                                  &SPA_FRACTION (1, 1),
+                                                                  &SPA_FRACTION (WINDOW_STREAM_MAX_FRAMERATE, 1)),
+    0);
+}
+
+/* One format with all the modifiers GTK can import it with, so Mutter
+ * renders into a DMA-BUF instead of reading the frame back */
+static const struct spa_pod *
+build_dmabuf_format_param (struct spa_pod_builder *builder,
+                           GdkDmabufFormats       *dmabuf_formats,
+                           uint32_t                spa_format)
+{
+  struct spa_pod_frame format_frame, choice_frame;
+  gboolean has_modifier = FALSE;
+  uint32_t fourcc;
+  gsize i;
+
+  if (!drm_fourcc_from_spa_format (spa_format, &fourcc))
+    return NULL;
+
+  spa_pod_builder_push_object (builder, &format_frame,
+                               SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+  spa_pod_builder_add (builder,
+    SPA_FORMAT_mediaType, SPA_POD_Id (SPA_MEDIA_TYPE_video),
+    SPA_FORMAT_mediaSubtype, SPA_POD_Id (SPA_MEDIA_SUBTYPE_raw),
+    SPA_FORMAT_VIDEO_format, SPA_POD_Id (spa_format),
+    0);
+
+  spa_pod_builder_prop (builder, SPA_FORMAT_VIDEO_modifier,
+                        SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+  spa_pod_builder_push_choice (builder, &choice_frame, SPA_CHOICE_Enum, 0);
+  for (i = 0; i < gdk_dmabuf_formats_get_n_formats (dmabuf_formats); i++)
+    {
+      uint32_t format_fourcc;
+      uint64_t modifier;
+
+      gdk_dmabuf_formats_get_format (dmabuf_formats, i, &format_fourcc, &modifier);
+      if (format_fourcc != fourcc || modifier == DRM_FORMAT_MOD_INVALID)
+        continue;
+
+      /* The first value of an enum choice is its default */
+      if (!has_modifier)
+        spa_pod_builder_long (builder, modifier);
+      spa_pod_builder_long (builder, modifier);
+      has_modifier = TRUE;
+    }
+  spa_pod_builder_pop (builder, &choice_frame);
+
+  add_common_format_props (builder);
+
+  if (!has_modifier)
+    {
+      spa_pod_builder_pop (builder, &format_frame);
+      return NULL;
+    }
+
+  return spa_pod_builder_pop (builder, &format_frame);
+}
+
 static void
 connect_pw_stream (ThumbnailStream *stream)
 {
   ScreenCastThumbnailer *self = stream->thumbnailer;
   uint32_t node_id = stream->node_id;
-  uint8_t params_buffer[1024];
+  uint8_t params_buffer[8192];
   struct spa_pod_builder builder =
     SPA_POD_BUILDER_INIT (params_buffer, sizeof (params_buffer));
-  const struct spa_pod *params[1];
+  struct spa_pod_frame format_frame;
+  const struct spa_pod *params[G_N_ELEMENTS (window_stream_formats) + 1];
+  const struct spa_pod *param;
+  unsigned int n_params = 0;
+  unsigned int i;
 
-  params[0] = spa_pod_builder_add_object (&builder,
-    SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+  /* PipeWire tries formats in order, so DMA-BUFs win when both sides
+   * support them; shared memory stays as the fallback */
+  if (!self->dmabuf_failed)
+    {
+      GdkDmabufFormats *dmabuf_formats =
+        gdk_display_get_dmabuf_formats (gdk_display_get_default ());
+
+      for (i = 0; dmabuf_formats && i < G_N_ELEMENTS (window_stream_formats); i++)
+        {
+          param = build_dmabuf_format_param (&builder, dmabuf_formats,
+                                             window_stream_formats[i]);
+          if (param)
+            params[n_params++] = param;
+        }
+    }
+
+  spa_pod_builder_push_object (&builder, &format_frame,
+                               SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+  spa_pod_builder_add (&builder,
     SPA_FORMAT_mediaType, SPA_POD_Id (SPA_MEDIA_TYPE_video),
     SPA_FORMAT_mediaSubtype, SPA_POD_Id (SPA_MEDIA_SUBTYPE_raw),
     SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id (5,
@@ -564,12 +951,20 @@ connect_pw_stream (ThumbnailStream *stream)
                                                      SPA_VIDEO_FORMAT_BGRA,
                                                      SPA_VIDEO_FORMAT_RGBx,
                                                      SPA_VIDEO_FORMAT_RGBA),
-    SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle (&SPA_RECTANGLE (320, 240),
-                                                           &SPA_RECTANGLE (1, 1),
-                                                           &SPA_RECTANGLE (16384, 16384)),
-    SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction (&SPA_FRACTION (0, 1),
-                                                               &SPA_FRACTION (0, 1),
-                                                               &SPA_FRACTION (360, 1)));
+    0);
+  add_common_format_props (&builder);
+  param = spa_pod_builder_pop (&builder, &format_frame);
+  if (param)
+    params[n_params++] = param;
+
+  /* Overflowing the builder leaves earlier params pointing into it */
+  if (builder.state.offset > builder.size)
+    {
+      g_debug ("Window thumbnail format params don't fit, using shared memory");
+      self->dmabuf_failed = TRUE;
+      connect_pw_stream (stream);
+      return;
+    }
 
   pw_thread_loop_lock (self->pw_loop);
 
@@ -591,7 +986,7 @@ connect_pw_stream (ThumbnailStream *stream)
                              PW_DIRECTION_INPUT,
                              node_id,
                              PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
-                             params, G_N_ELEMENTS (params)) < 0)
+                             params, n_params) < 0)
         g_debug ("Failed to connect to PipeWire node %u", node_id);
     }
 
@@ -660,6 +1055,25 @@ finish_stream (ThumbnailStream *stream)
     screen_cast_thumbnailer_stop (self);
   else
     connect_more_streams (self);
+}
+
+/* Connects again, keeping the slot, now that DMA-BUFs are off */
+static void
+retry_stream (ThumbnailStream *stream)
+{
+  if (stream->finished)
+    return;
+
+  disconnect_pw_stream (stream);
+  stream->has_format = FALSE;
+  stream->dmabuf = FALSE;
+  stream->captured = FALSE;
+
+  g_clear_handle_id (&stream->timeout_id, g_source_remove);
+  connect_pw_stream (stream);
+  stream->timeout_id = g_timeout_add (WINDOW_STREAM_TIMEOUT_MS,
+                                      on_stream_timeout_cb,
+                                      stream);
 }
 
 static void
@@ -828,6 +1242,7 @@ start_session (ScreenCastThumbnailer  *self,
   g_autoptr(OrgGnomeMutterScreenCast) screen_cast = NULL;
   GVariantBuilder properties_builder;
   g_autofree char *session_path = NULL;
+  int64_t setup_start_time = g_get_monotonic_time ();
   unsigned int i;
 
   if (g_list_model_get_n_items (windows) == 0)
@@ -886,6 +1301,8 @@ start_session (ScreenCastThumbnailer  *self,
     return FALSE;
 
   self->start_time = g_get_monotonic_time ();
+  g_debug ("Window thumbnail session for %u windows set up in %" G_GINT64_FORMAT " ms",
+           self->n_pending, (self->start_time - setup_start_time) / 1000);
   self->timeout_id =
     g_timeout_add (SESSION_EXTRA_TIMEOUT_MS +
                    WINDOW_STREAM_TIMEOUT_MS * ((self->n_pending + MAX_ACTIVE_WINDOW_STREAMS - 1) /
@@ -902,6 +1319,7 @@ release_session (ScreenCastThumbnailer *self)
   teardown_pipewire (self);
   g_queue_clear (&self->streams_to_connect);
   g_ptr_array_set_size (self->streams, 0);
+  g_clear_object (&self->renderer);
 
   if (self->session)
     {
@@ -981,6 +1399,7 @@ screen_cast_thumbnailer_new (void)
 /**
  * screen_cast_thumbnailer_start:
  * @windows: a list of `ShellWindow`s
+ * @renderer: (nullable): renders the thumbnails down to size
  *
  * Records each window once and emits `thumbnail-ready` per captured frame,
  * then `done` when all frames arrived, on timeout, or on failure. Can only be
@@ -988,7 +1407,8 @@ screen_cast_thumbnailer_new (void)
  */
 void
 screen_cast_thumbnailer_start (ScreenCastThumbnailer *self,
-                               GListModel            *windows)
+                               GListModel            *windows,
+                               GskRenderer           *renderer)
 {
   g_autoptr(GError) error = NULL;
 
@@ -998,6 +1418,7 @@ screen_cast_thumbnailer_start (ScreenCastThumbnailer *self,
     return;
 
   self->started = TRUE;
+  g_set_object (&self->renderer, renderer);
 
   if (!start_session (self, windows, &error))
     g_warning ("Failed to capture window thumbnails: %s", error->message);

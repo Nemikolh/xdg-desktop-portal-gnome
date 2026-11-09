@@ -528,7 +528,8 @@ maybe_start_window_thumbnails (ScreenCastWidget *self)
   if (selected_page != ADW_VIEW_STACK_PAGE (self->window_selection_page))
     return;
 
-  screen_cast_thumbnailer_start (self->thumbnailer, self->filter_model);
+  screen_cast_thumbnailer_start (self->thumbnailer, self->filter_model,
+                                 gtk_native_get_renderer (gtk_widget_get_native (GTK_WIDGET (self))));
 }
 
 static void

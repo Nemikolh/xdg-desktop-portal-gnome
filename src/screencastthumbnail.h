@@ -40,7 +40,8 @@ G_DECLARE_FINAL_TYPE (ScreenCastThumbnailer, screen_cast_thumbnailer,
 ScreenCastThumbnailer * screen_cast_thumbnailer_new (void);
 
 void         screen_cast_thumbnailer_start   (ScreenCastThumbnailer *self,
-                                              GListModel            *windows);
+                                              GListModel            *windows,
+                                              GskRenderer           *renderer);
 
 void         screen_cast_thumbnailer_stop    (ScreenCastThumbnailer *self);
 
