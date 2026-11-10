@@ -355,6 +355,8 @@ struct _ScreenCastThumbnailer
   struct pw_core *pw_core;
 
   GskRenderer *renderer;
+  GskRenderer *gl_renderer;
+  gboolean gl_renderer_failed;
   gboolean dmabuf_failed;
 
   /* Windows still to record, and RecordWindow calls in flight */
@@ -479,6 +481,62 @@ import_dmabuf (ThumbnailDmabuf  *dmabuf,
   return texture;
 }
 
+/* Mutter renders with EGL, so GL can sample whatever modifier it picked. The
+ * dialog's renderer may not: with Vulkan on NVIDIA, GTK reads the whole frame
+ * back from the GPU instead, about 100 ms for each 5K window stream. */
+static GskRenderer *
+get_scaling_renderer (ScreenCastThumbnailer *self)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GskRenderer) gl_renderer = NULL;
+
+  /* Frames arriving after stop () don't get a new renderer */
+  if (self->gl_renderer || self->gl_renderer_failed || self->done)
+    return self->gl_renderer ? self->gl_renderer : self->renderer;
+
+  gl_renderer = gsk_gl_renderer_new ();
+  if (!gsk_renderer_realize_for_display (gl_renderer, gdk_display_get_default (), &error))
+    {
+      g_debug ("Scaling window thumbnails with the dialog's renderer: %s", error->message);
+      self->gl_renderer_failed = TRUE;
+      return self->renderer;
+    }
+
+  self->gl_renderer = g_steal_pointer (&gl_renderer);
+  return self->gl_renderer;
+}
+
+static void
+clear_gl_renderer (ScreenCastThumbnailer *self)
+{
+  if (!self->gl_renderer)
+    return;
+
+  gsk_renderer_unrealize (self->gl_renderer);
+  g_clear_object (&self->gl_renderer);
+}
+
+/* Textures of our own GL context stay usable by the dialog's renderer only
+ * through a download, so do it once while they're small */
+static GdkTexture *
+to_memory_texture (GdkTexture *texture)
+{
+  g_autoptr(GdkTextureDownloader) downloader = NULL;
+  g_autoptr(GBytes) bytes = NULL;
+  gsize stride;
+
+  if (GDK_IS_MEMORY_TEXTURE (texture))
+    return g_object_ref (texture);
+
+  downloader = gdk_texture_downloader_new (texture);
+  bytes = gdk_texture_downloader_download_bytes (downloader, &stride);
+  return gdk_memory_texture_new (gdk_texture_get_width (texture),
+                                 gdk_texture_get_height (texture),
+                                 gdk_texture_downloader_get_format (downloader),
+                                 bytes,
+                                 stride);
+}
+
 /* Renders the visible @area of @texture into a small texture, so neither the
  * full-size frame nor its DMA-BUF have to be kept around for the dialog. */
 static GdkTexture *
@@ -490,7 +548,8 @@ scale_down_texture (ScreenCastThumbnailer *self,
                     int                    height)
 {
   g_autoptr(GskRenderNode) node = NULL;
-  GdkTexture *scaled;
+  g_autoptr(GdkTexture) scaled = NULL;
+  GskRenderer *renderer;
   int texture_width = gdk_texture_get_width (texture);
   int texture_height = gdk_texture_get_height (texture);
   gboolean cropped;
@@ -501,7 +560,8 @@ scale_down_texture (ScreenCastThumbnailer *self,
   scale = MIN (1.0, MIN ((double) THUMBNAIL_MAX_WIDTH / width,
                          (double) THUMBNAIL_MAX_HEIGHT / height));
 
-  if (!self->renderer || !gsk_renderer_is_realized (self->renderer))
+  renderer = get_scaling_renderer (self);
+  if (!renderer || !gsk_renderer_is_realized (renderer))
     return g_object_ref (texture);
 
   if (scale == 1.0 && !cropped && GDK_IS_MEMORY_TEXTURE (texture))
@@ -522,12 +582,16 @@ scale_down_texture (ScreenCastThumbnailer *self,
                                                           texture_height * scale_y),
                                      GSK_SCALING_FILTER_TRILINEAR);
 
-  scaled = gsk_renderer_render_texture (self->renderer,
+  scaled = gsk_renderer_render_texture (renderer,
                                         node,
                                         &GRAPHENE_RECT_INIT (0, 0,
                                                              scaled_width,
                                                              scaled_height));
-  return scaled ? scaled : g_object_ref (texture);
+  if (!scaled)
+    return g_object_ref (texture);
+
+  return renderer == self->gl_renderer ? to_memory_texture (scaled)
+                                       : g_steal_pointer (&scaled);
 }
 
 static gboolean
@@ -1474,6 +1538,7 @@ release_session (ScreenCastThumbnailer *self)
   g_ptr_array_set_size (self->streams, 0);
   g_clear_pointer (&self->windows, g_ptr_array_unref);
   g_clear_object (&self->renderer);
+  clear_gl_renderer (self);
 
   if (self->session)
     {
@@ -1553,7 +1618,7 @@ screen_cast_thumbnailer_new (void)
 /**
  * screen_cast_thumbnailer_start:
  * @windows: a list of `ShellWindow`s
- * @renderer: (nullable): renders the thumbnails down to size
+ * @renderer: (nullable): renders the thumbnails down to size if GL is unavailable
  *
  * Records each window once and emits `thumbnail-ready` per captured frame,
  * then `done` when all frames arrived, on timeout, or on failure. Can only be
